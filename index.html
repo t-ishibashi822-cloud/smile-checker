@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>高精度スマイルチェッカー</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #eef2f5; text-align: center; margin: 0; padding: 10px; }
+    h2 { color: #333; margin-bottom: 15px; font-size: 20px; }
+    .wrapper { position: relative; display: inline-block; width: 100%; max-width: 500px; background: white; padding: 10px; border-radius: 15px; box-shadow: 0 5px 20px rgba(0,0,0,0.1); box-sizing: border-box; }
+    .canvas-container { position: relative; width: 100%; aspect-ratio: 4 / 3; overflow: hidden; border-radius: 10px; background: #000; }
+    video, canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); }
+    video { object-fit: cover; }
+    canvas { z-index: 5; pointer-events: none; }
+    
+    .score-badge { position: absolute; top: 15px; left: 15px; background: rgba(255, 71, 87, 0.95); padding: 8px 18px; border-radius: 20px; font-size: 22px; font-weight: bold; color: white; box-shadow: 0 3px 8px rgba(0,0,0,0.2); z-index: 10; }
+    .timer-badge { position: absolute; top: 15px; right: 15px; background: rgba(255, 159, 26, 0.95); padding: 8px 15px; border-radius: 20px; font-size: 18px; font-weight: bold; color: white; display: none; z-index: 10; box-shadow: 0 3px 8px rgba(0,0,0,0.2); }
+
+    .congrats-overlay {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(255, 255, 255, 0.96);
+      display: flex; flex-direction: column; justify-content: center; align-items: center;
+      z-index: 20; opacity: 0; pointer-events: none; transition: opacity 0.4s ease;
+      border-radius: 10px; padding: 10px; box-sizing: border-box;
+    }
+    .congrats-overlay.active { opacity: 1; pointer-events: auto; }
+    .congrats-title { font-size: 22px; color: #2ed573; font-weight: bold; margin-bottom: 8px; }
+    .captured-img { width: 85%; height: auto; max-height: 250px; border-radius: 8px; border: 2px solid #2ed573; box-shadow: 0 4px 12px rgba(0,0,0,0.15); object-fit: contain; margin-bottom: 10px; }
+    .reset-btn { background: #2ed573; color: white; border: none; padding: 10px 24px; font-size: 16px; font-weight: bold; border-radius: 25px; cursor: pointer; box-shadow: 0 3px 8px rgba(0,0,0,0.2); }
+    
+    #status { margin-top: 15px; color: #555; font-size: 14px; font-weight: bold; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
+</head>
+<body>
+
+  <h2>😊 スマイルチェッカー (高精度版)</h2>
+  <div class="wrapper">
+    <div class="score-badge">笑顔度: <span id="score">0</span>%</div>
+    <div id="timer-badge" class="timer-badge">⏱️ あと 3.0秒</div>
+    
+    <div class="canvas-container">
+      <video id="webcam" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+
+      <div id="congrats-overlay" class="congrats-overlay">
+        <div class="congrats-title">🎉 おめでとうございます！</div>
+        <img id="captured-img" class="captured-img" alt="作成されたAI笑顔アドバイスシート">
+        <p style="margin: 0 0 10px 0; font-size: 13px; color: #555;">アドバイスシートを保存しました！</p>
+        <button id="reset-btn" class="reset-btn">もう一度挑戦する</button>
+      </div>
+    </div>
+  </div>
+  <div id="status">AIエンジンを起動中...</div>
+
+  <script type="module">
+    import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/+esm";
+
+    const video = document.getElementById('webcam');
+    const canvas = document.getElementById('overlay');
+    const ctx = canvas.getContext('2d');
+    const scoreEl = document.getElementById('score');
+    const timerBadge = document.getElementById('timer-badge');
+    const statusEl = document.getElementById('status');
+    const congratsOverlay = document.getElementById('congrats-overlay');
+    const capturedImg = document.getElementById('captured-img');
+    const resetBtn = document.getElementById('reset-btn');
+
+    let faceLandmarker;
+    let lastVideoTime = -1;
+    let smileStartTime = null;
+    let isCompleted = false;
+
+    async function initAI() {
+      try {
+        statusEl.textContent = 'AIモデルをダウンロード中...';
+        const filesetResolver = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+        );
+        
+        faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+            delegate: "GPU"
+          },
+          outputFaceBlendshapes: true,
+          runningMode: "VIDEO",
+          numFaces: 1
+        });
+
+        statusEl.textContent = 'カメラの許可を待っています...';
+        await startCamera();
+      } catch (e) {
+        statusEl.textContent = '初期化エラー: ' + e.message;
+        statusEl.style.color = '#ff6b6b';
+      }
+    }
+
+    async function startCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false
+        });
+        video.srcObject = stream;
+        video.addEventListener("loadeddata", predictLoop);
+        statusEl.textContent = '準備完了！80%以上の笑顔を3秒キープしてください';
+        statusEl.style.color = '#00a8ff';
+      } catch (err) {
+        statusEl.textContent = 'カメラ起動エラー: ' + err.message;
+        statusEl.style.color = '#ff6b6b';
+      }
+    }
+
+    function predictLoop() {
+      if (video.videoWidth) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+      }
+
+      if (video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+        const startTimeMs = performance.now();
+        const results = faceLandmarker.detectForVideo(video, startTimeMs);
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+          const landmarks = results.faceLandmarks[0];
+          drawLandmarks(landmarks);
+
+          let smileScore = 0;
+          if (results.faceBlendshapes && results.faceBlendshapes.length > 0) {
+            const shapes = results.faceBlendshapes[0].categories;
+            const smileLeft = shapes.find(s => s.categoryName === 'mouthSmileLeft')?.score || 0;
+            const smileRight = shapes.find(s => s.categoryName === 'mouthSmileRight')?.score || 0;
+            const rawScore = (smileLeft + smileRight) / 2;
+            smileScore = Math.min(100, Math.round(rawScore * 100));
+          }
+
+          scoreEl.textContent = smileScore;
+
+          if (smileScore >= 80 && !isCompleted) {
+            if (!smileStartTime) smileStartTime = performance.now();
+            const elapsedTime = (performance.now() - smileStartTime) / 1000;
+            const remainingTime = Math.max(0, 3.0 - elapsedTime).toFixed(1);
+
+            timerBadge.style.display = 'block';
+            timerBadge.textContent = `⏱️ あと ${remainingTime}秒！`;
+
+            if (elapsedTime >= 3.0) {
+              isCompleted = true;
+              timerBadge.style.display = 'none';
+              triggerSuccess(smileScore);
+            }
+          } else {
+            if (!isCompleted) {
+              smileStartTime = null;
+              timerBadge.style.display = 'none';
+            }
+          }
+
+          if (!isCompleted) {
+            statusEl.textContent = `顔を検出中！ (笑顔度: ${smileScore}%)`;
+            statusEl.style.color = '#4cd137';
+          }
+        } else {
+          scoreEl.textContent = '0';
+          timerBadge.style.display = 'none';
+          smileStartTime = null;
+          statusEl.textContent = '顔を探しています... 画面の中央に入ってください';
+          statusEl.style.color = '#e74c3c';
+        }
+      }
+      requestAnimationFrame(predictLoop);
+    }
+
+    function generateReportCard(finalScore) {
+      const cardCanvas = document.createElement('canvas');
+      cardCanvas.width = 800;
+      cardCanvas.height = 1050;
+      const cctx = cardCanvas.getContext('2d');
+
+      cctx.fillStyle = "#f3f7f0";
+      cctx.fillRect(0, 0, 800, 1050);
+
+      cctx.strokeStyle = "#4b7941";
+      cctx.lineWidth = 12;
+      cctx.strokeRect(10, 10, 780, 1030);
+
+      cctx.strokeStyle = "#6b9b60";
+      cctx.lineWidth = 2;
+      cctx.strokeRect(22, 22, 756, 1006);
+
+      cctx.fillStyle = "#ffffff";
+      cctx.beginPath();
+      cctx.arc(110, 80, 35, 0, Math.PI * 2);
+      cctx.fill();
+      cctx.strokeStyle = "#4b7941";
+      cctx.lineWidth = 3;
+      cctx.stroke();
+
+      cctx.font = "bold 36px sans-serif";
+      cctx.fillStyle = "#4b7941";
+      cctx.fillText("😊 AI笑顔アドバイスシート", 160, 92);
+
+      cctx.font = "bold 22px sans-serif";
+      cctx.fillStyle = "#333333";
+      cctx.fillText("あなたの笑顔スコアはどうでしたか？", 200, 140);
+
+      const today = new Date();
+      const dateStr = `測定日：${today.getFullYear()}年${today.getMonth() + 1}月${today.getDate()}日`;
+      cctx.font = "18px sans-serif";
+      cctx.fillStyle = "#666666";
+      cctx.fillText(dateStr, 540, 175);
+
+      cctx.fillStyle = "#ffffff";
+      cctx.fillRect(50, 190, 380, 285);
+      cctx.strokeStyle = "#88b080";
+      cctx.lineWidth = 4;
+      cctx.strokeRect(50, 190, 380, 285);
+
+      cctx.save();
+      cctx.translate(50 + 380, 190);
+      cctx.scale(-1, 1);
+      cctx.drawImage(video, 0, 0, 380, 285);
+      cctx.restore();
+
+      cctx.fillStyle = "#e2efe0";
+      cctx.fillRect(450, 190, 300, 285);
+      cctx.strokeStyle = "#6b9b60";
+      cctx.lineWidth = 3;
+      cctx.strokeRect(450, 190, 300, 285);
+
+      cctx.font = "bold 20px sans-serif";
+      cctx.fillStyle = "#4b7941";
+      cctx.fillText("判定結果", 550, 230);
+
+      cctx.font = "bold 32px sans-serif";
+      cctx.fillStyle = "#ff4757";
+      cctx.fillText(`笑顔スコア: ${finalScore}点`, 470, 290);
+
+      cctx.font = "bold 26px sans-serif";
+      cctx.fillStyle = "#2e7d32";
+      cctx.fillText("✨ いい笑顔です！", 485, 360);
+
+      cctx.fillStyle = "#4b7941";
+      cctx.beginPath();
+      cctx.roundRect(50, 500, 700, 45, 10);
+      cctx.fill();
+
+      cctx.font = "bold 22px sans-serif";
+      cctx.fillStyle = "#ffffff";
+      cctx.fillText("より良い笑顔になるためには？", 260, 530);
+
+      const items = [
+        { label: "口角", text: "思い切り上げてみましょう。頬も一緒に上げるイメージです。" },
+        { label: "口幅", text: "横に広げてみましょう。「イー」の口のイメージです。" },
+        { label: "上唇", text: "上の前歯が数本見えるように上げてみましょう。" }
+      ];
+
+      items.forEach((item, idx) => {
+        const yPos = 570 + idx * 75;
+        cctx.fillStyle = "#ffffff";
+        cctx.fillRect(50, yPos, 700, 60);
+        cctx.strokeStyle = "#cccccc";
+        cctx.lineWidth = 1;
+        cctx.strokeRect(50, yPos, 700, 60);
+
+        cctx.fillStyle = "#e2efe0";
+        cctx.beginPath();
+        cctx.roundRect(60, yPos + 8, 80, 44, 8);
+        cctx.fill();
+        cctx.strokeStyle = "#4b7941";
+        cctx.lineWidth = 2;
+        cctx.stroke();
+
+        cctx.font = "bold 20px sans-serif";
+        cctx.fillStyle = "#4b7941";
+        cctx.fillText(item.label, 78, yPos + 36);
+
+        cctx.font = "17px sans-serif";
+        cctx.fillStyle = "#333333";
+        cctx.fillText(item.text, 160, yPos + 36);
+      });
+
+      cctx.fillStyle = "#4b7941";
+      cctx.beginPath();
+      cctx.roundRect(50, 810, 700, 40, 10);
+      cctx.fill();
+
+      cctx.font = "bold 20px sans-serif";
+      cctx.fillStyle = "#ffffff";
+      cctx.fillText("笑顔が健康につながる？", 280, 837);
+
+      cctx.font = "16px sans-serif";
+      cctx.fillStyle = "#333333";
+      cctx.fillText("笑顔の健康への効果を唱える研究は多く見られます。", 60, 880);
+      cctx.fillText("笑うことで自律神経を整え、幸福ホルモン「セロトニン」を分泌し、", 60, 905);
+      cctx.fillText("免疫機能を向上させることが知られています。", 60, 930);
+
+      cctx.font = "bold 20px sans-serif";
+      cctx.fillStyle = "#4b7941";
+      cctx.fillText("😊 もう1度チャレンジ！高得点をめざしましょう！", 170, 985);
+
+      return cardCanvas.toDataURL('image/png');
+    }
+
+    function triggerSuccess(score) {
+      const dataUrl = generateReportCard(score);
+
+      const link = document.createElement('a');
+      link.href = dataUrl;
+      link.download = `smile_sheet_${Date.now()}.png`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      capturedImg.src = dataUrl;
+      congratsOverlay.classList.add('active');
+      statusEl.textContent = '🎉 撮影成功！アドバイスシートが保存されました';
+
+      if (window.confetti) {
+        confetti({
+          particleCount: 120,
+          spread: 80,
+          origin: { y: 0.6 }
+        });
+      }
+    }
+
+    resetBtn.addEventListener('click', () => {
+      congratsOverlay.classList.remove('active');
+      isCompleted = false;
+      smileStartTime = null;
+      statusEl.textContent = '準備完了！80%以上の笑顔を3秒キープしてください';
+      statusEl.style.color = '#00a8ff';
+    });
+
+    function drawLandmarks(landmarks) {
+      ctx.fillStyle = '#00ff00';
+      landmarks.forEach((pt, idx) => {
+        if (idx % 3 === 0) {
+          const x = pt.x * canvas.width;
+          const y = pt.y * canvas.height;
+          ctx.beginPath();
+          ctx.arc(x, y, 2, 0, 2 * Math.PI);
+          ctx.fill();
+        }
+      });
+    }
+
+    initAI();
+  </script>
+</body>
+</html>
